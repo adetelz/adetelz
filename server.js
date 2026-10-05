@@ -4,18 +4,30 @@ const crypto = require('crypto');
 const express = require('express');
 const multer = require('multer');
 const archiver = require('archiver');
+const os = require('os');
 const Store = require('./lib/store');
+const { DiskBackend, SupabaseBackend } = require('./lib/backends');
 const { normalizeForm, validateSubmission } = require('./lib/fields');
 const views = require('./lib/views');
 
-function createApp({
-  dataDir = process.env.DATA_DIR || path.join(__dirname, 'data'),
+// Supabase when SUPABASE_URL + SUPABASE_SECRET_KEY are set, else a local folder.
+function defaultBackend() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (url && key) {
+    return new SupabaseBackend({ url, key, bucket: process.env.SUPABASE_BUCKET, tmpDir: path.join(os.tmpdir(), 'form-uploads') });
+  }
+  return new DiskBackend(process.env.DATA_DIR || path.join(__dirname, 'data'));
+}
+
+async function createApp({
+  backend = defaultBackend(),
   adminPassword = process.env.ADMIN_PASSWORD,
   sessionSecret = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
   publicUrl = process.env.PUBLIC_URL,
 } = {}) {
   if (!adminPassword) throw new Error('ADMIN_PASSWORD is required');
-  const store = new Store(dataDir);
+  const store = await Store.open(backend);
   const app = express();
   if (process.env.TRUST_PROXY) app.set('trust proxy', 1);
 
@@ -93,16 +105,18 @@ function createApp({
 
   app.post('/admin/api/forms', requireAdmin, (req, res) => saveForm(req, res, null));
   app.put('/admin/api/forms/:id', requireAdmin, loadForm, (req, res) => saveForm(req, res, req.form.id));
-  function saveForm(req, res, id) {
+  async function saveForm(req, res, id) {
+    let input;
     try {
-      const form = store.saveForm(normalizeForm(req.body), id);
-      res.json({ id: form.id });
+      input = normalizeForm(req.body);
     } catch (e) {
-      res.status(400).json({ error: e.message });
+      return res.status(400).json({ error: e.message });
     }
+    const form = await store.saveForm(input, id);
+    res.json({ id: form.id });
   }
-  app.delete('/admin/api/forms/:id', requireAdmin, loadForm, (req, res) => {
-    store.deleteForm(req.form.id);
+  app.delete('/admin/api/forms/:id', requireAdmin, loadForm, async (req, res) => {
+    await store.deleteForm(req.form.id);
     res.json({ ok: true });
   });
 
@@ -134,42 +148,53 @@ function createApp({
     res.type('text/csv').send('﻿' + lines.join('\r\n'));
   });
 
-  app.get('/admin/forms/:id/files.zip', requireAdmin, loadForm, (req, res) => {
+  app.get('/admin/forms/:id/files.zip', requireAdmin, loadForm, async (req, res) => {
     const form = req.form;
     res.attachment(`${slug(form.title)}-files.zip`);
     const zip = archiver('zip', { zlib: { level: 6 } });
     zip.on('error', (err) => res.destroy(err));
     zip.pipe(res);
+    // Fetch one file at a time so a large form doesn't open every download at once.
     for (const s of store.submissionsFor(form.id)) {
       const folder = `${s.createdAt.replace(/[:.]/g, '-')}_${s.id}`;
       for (const f of form.fields.filter((x) => x.type === 'file')) {
         for (const file of s.files?.[f.id] || []) {
-          const p = path.join(store.uploadDir, file.storedName);
-          if (fs.existsSync(p)) zip.file(p, { name: `${folder}/${slug(f.label)}/${safeName(file.originalName)}` });
+          const stream = await store.backend.getFile(file.storedName);
+          if (!stream) continue;
+          const added = new Promise((resolve, reject) => {
+            zip.once('entry', resolve);
+            stream.once('error', reject);
+          });
+          zip.append(stream, { name: `${folder}/${slug(f.label)}/${safeName(file.originalName)}` });
+          await added;
         }
       }
     }
-    zip.finalize();
+    await zip.finalize();
   });
 
-  app.get('/admin/files/:subId/:fileId', requireAdmin, (req, res) => {
+  app.get('/admin/files/:subId/:fileId', requireAdmin, async (req, res) => {
     const sub = store.getSubmission(req.params.subId);
     const file = sub && Object.values(sub.files || {}).flat().find((f) => f.id === req.params.fileId);
-    if (!file) return res.status(404).send(views.notFound());
-    res.download(path.join(store.uploadDir, file.storedName), safeName(file.originalName));
+    const stream = file && (await store.backend.getFile(file.storedName));
+    if (!stream) return res.status(404).send(views.notFound());
+    res.attachment(safeName(file.originalName));
+    res.type('application/octet-stream');
+    if (file.size) res.set('Content-Length', String(file.size));
+    stream.on('error', (err) => res.destroy(err));
+    stream.pipe(res);
   });
 
-  app.post('/admin/submissions/:id/delete', requireAdmin, (req, res) => {
+  app.post('/admin/submissions/:id/delete', requireAdmin, async (req, res) => {
     const sub = store.getSubmission(req.params.id);
-    if (sub) store.deleteSubmission(sub.id);
+    if (sub) await store.deleteSubmission(sub.id);
     res.redirect(sub ? `/admin/forms/${sub.formId}/responses` : '/admin');
   });
 
   // ---- Public form: no login, anyone with the link can respond ----
   app.get('/f/:id', loadForm, (req, res) => res.send(views.publicForm(req.form)));
 
-  const tmpDir = path.join(store.uploadDir, 'tmp');
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = backend.tmpDir;
 
   app.post('/f/:id', loadForm, (req, res) => {
     const form = req.form;
@@ -190,7 +215,7 @@ function createApp({
       fileFilter: (r, f, cb) => cb(null, fileFields.some((x) => x.id === f.fieldname)),
     }).any();
 
-    upload(req, res, (err) => {
+    upload(req, res, async (err) => {
       const uploaded = req.files || [];
       const cleanup = () => uploaded.forEach((f) => fs.rmSync(f.path, { force: true }));
       if (err) {
@@ -213,13 +238,23 @@ function createApp({
       }
 
       const files = {};
-      for (const [fieldId, list] of Object.entries(byField)) {
-        files[fieldId] = list.map((f) => {
-          fs.renameSync(f.path, path.join(store.uploadDir, f.filename));
-          return { id: Store.id(), storedName: f.filename, originalName: f.originalname, size: f.size, mimeType: f.mimetype };
-        });
+      const stored = [];
+      try {
+        for (const [fieldId, list] of Object.entries(byField)) {
+          files[fieldId] = [];
+          for (const f of list) {
+            await backend.putFile(f.filename, f.path, f.mimetype);
+            stored.push(f.filename);
+            files[fieldId].push({ id: Store.id(), storedName: f.filename, originalName: f.originalname, size: f.size, mimeType: f.mimetype });
+          }
+        }
+        await store.addSubmission(form.id, answers, files);
+      } catch (e) {
+        console.error('Saving submission failed:', e);
+        cleanup();
+        await backend.deleteFiles(stored).catch(() => {});
+        return res.status(500).send(views.publicForm(form, { values: answers, formError: 'Sorry, we could not save your response. Please try again.' }));
       }
-      store.addSubmission(form.id, answers, files);
       res.redirect(303, `/f/${form.id}/thanks`);
     });
   });
@@ -245,5 +280,10 @@ if (require.main === module) {
     console.log(`No ADMIN_PASSWORD set. Generated one for this run: ${process.env.ADMIN_PASSWORD}`);
   }
   const port = Number(process.env.PORT) || 3000;
-  createApp().listen(port, () => console.log(`Forms running at http://localhost:${port}/admin`));
+  createApp()
+    .then((app) => app.listen(port, () => console.log(`Forms running at http://localhost:${port}/admin`)))
+    .catch((e) => {
+      console.error('Failed to start:', e.message);
+      process.exit(1);
+    });
 }

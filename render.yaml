@@ -2,20 +2,21 @@ services:
   - type: web
     name: adetelz-forms
     runtime: node
-    plan: starter # persistent disks need a paid plan; uploads would be lost on the free plan
+    plan: free
     buildCommand: npm ci --omit=dev
     startCommand: node server.js
     healthCheckPath: /admin/login
     envVars:
+      # You are asked for the values marked sync: false when creating the service.
       - key: ADMIN_PASSWORD
-        sync: false # you are asked for this when creating the service
+        sync: false
+      - key: SUPABASE_URL # e.g. https://abcdefgh.supabase.co
+        sync: false
+      - key: SUPABASE_SECRET_KEY # Supabase → Project Settings → API Keys → secret key
+        sync: false
       - key: SESSION_SECRET
         generateValue: true
-      - key: DATA_DIR
-        value: /var/data
+      - key: MAX_UPLOAD_MB # Supabase free plan limit per file
+        value: "50"
       - key: TRUST_PROXY
         value: "1"
-    disk:
-      name: forms-data
-      mountPath: /var/data
-      sizeGB: 5

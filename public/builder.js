@@ -1,6 +1,6 @@
 // Form builder: edits a JSON form definition client-side and saves it via the admin API.
 (function () {
-  const { form, id, types } = JSON.parse(document.getElementById('form-data').textContent);
+  const { form, id, types, maxUploadMb } = JSON.parse(document.getElementById('form-data').textContent);
   const root = document.getElementById('builder');
   const CHOICE = ['select', 'radio', 'checkbox'];
   let formId = id;
@@ -54,7 +54,7 @@
         h('label', {}, 'Allowed types',
           h('input', { value: f.accept, placeholder: 'e.g. .pdf,.docx,.jpg (blank = any)', oninput: change((e) => { f.accept = e.target.value; }) })),
         h('label', {}, 'Max size (MB)',
-          h('input', { type: 'number', min: 1, max: 100, value: f.maxSizeMb, oninput: change((e) => { f.maxSizeMb = Number(e.target.value); }) })),
+          h('input', { type: 'number', min: 1, max: maxUploadMb, value: f.maxSizeMb, oninput: change((e) => { f.maxSizeMb = Number(e.target.value); }) })),
         h('label', {}, 'Max files',
           h('input', { type: 'number', min: 1, max: 20, value: f.maxFiles, oninput: change((e) => { f.maxFiles = Number(e.target.value); }) }))));
     }
