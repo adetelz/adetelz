@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: adetelz-forms
+    runtime: node
+    plan: starter # persistent disks need a paid plan; uploads would be lost on the free plan
+    buildCommand: npm ci --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /admin/login
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false # you are asked for this when creating the service
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DATA_DIR
+        value: /var/data
+      - key: TRUST_PROXY
+        value: "1"
+    disk:
+      name: forms-data
+      mountPath: /var/data
+      sizeGB: 5
